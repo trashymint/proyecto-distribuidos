@@ -2,6 +2,8 @@ import zmq
 import json
 import os
 import threading
+import time
+from collections import deque
 from datetime import datetime, timezone
 
 def cargar_config():
@@ -10,16 +12,15 @@ def cargar_config():
         return json.load(f)
 
 config = cargar_config()
-
 IP_PC1 = config['ips']['PC1']
 IP_PC2 = config['ips']['PC2']
 IP_PC3 = config['ips']['PC3']
 P      = config['puertos']
-
 REGLAS = config['reglas']
 
-# ── Estado compartido entre el hilo de eventos y el hilo de comandos ──────────
+# ── Estado compartido ─────────────────────────────────────────────────────────
 lock_estado = threading.Lock()
+lock_pc3    = threading.Lock()
 
 filas          = config['ciudad']['filas']
 columnas       = config['ciudad']['columnas']
@@ -27,65 +28,125 @@ intersecciones = [f"INT_{f}{c}" for f in filas for c in columnas]
 
 estado_intersecciones = {
     inter: {
-        "cola":           None,     # vehículos en espera (cámara)
-        "velocidad":      None,     # km/h (cámara / GPS)
-        "densidad":       None,     # veh/min derivado de espira
-        "congestion_gps": None,     # ALTA / NORMAL / BAJA
-        "estado":         "NORMAL", # NORMAL / CONGESTION / PRIORIDAD
-        "sem_fila":       "VERDE",  # semáforo tráfico horizontal (calle)
-        "sem_carrera":    "ROJO"    # semáforo tráfico vertical  (carrera)
+        "cola":           None,
+        "velocidad":      None,
+        "densidad":       None,
+        "congestion_gps": None,
+        "estado":         "NORMAL",
+        "sem_fila":       "VERDE",
+        "sem_carrera":    "ROJO"
     }
     for inter in intersecciones
 }
 
-# ── Evaluación de reglas de tráfico ──────────────────────────────────────────
+# ── Health check y buffer de sincronización ───────────────────────────────────
+pc3_disponible   = True
+pc3_estaba_caido = False
+buffer_sync      = deque(maxlen=5000)   # eventos pendientes de enviar a PC3
+
+# ── Reglas del sistema ────────────────────────────────────────────────────────
+REGLAS_DESCRIPCION = f"""
+╔══════════════════════════════════════════════════════════╗
+║           REGLAS DEL SISTEMA DE TRÁFICO                  ║
+╠══════════════════════════════════════════════════════════╣
+║  Estado NORMAL:                                          ║
+║    Cola (Q) < {REGLAS['max_cola_normal']} vehículos                            ║
+║    Velocidad (Vp) > {REGLAS['min_velocidad_normal']} km/h                         ║
+║    Densidad (D) < {REGLAS['max_densidad_normal']} veh/min                          ║
+║                                                          ║
+║  Estado CONGESTION (correlación: ≥2 condiciones):        ║
+║    Cola (Q) ≥ {REGLAS['max_cola_normal']} vehículos                            ║
+║    Velocidad (Vp) ≤ {REGLAS['max_velocidad_congestion']} km/h                         ║
+║    Densidad (D) ≥ {REGLAS['max_densidad_normal']} veh/min                          ║
+║                                                          ║
+║  Estado PRIORIDAD (manual):                              ║
+║    Ola verde activada por usuario (ej. ambulancia)       ║
+║                                                          ║
+║  Tiempos de semáforo:                                    ║
+║    Normal:     {config['semaforos']['tiempo_verde_normal']}s por fase (FILA/CARRERA)             ║
+║    Congestion: {config['semaforos']['tiempo_verde_congestion']}s por fase                          ║
+╚══════════════════════════════════════════════════════════╝
+"""
+
+def ts():
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+# ── Evaluación de reglas con correlación ─────────────────────────────────────
 def evaluar_estado(datos):
+    """
+    CONGESTION requiere correlación: al menos 2 de 3 condiciones deben cumplirse.
+    Esto evita falsos positivos por un solo sensor con datos ruidosos.
+    """
+    if datos["estado"] == "PRIORIDAD":
+        return "PRIORIDAD"
+
     cola      = datos.get("cola")
     velocidad = datos.get("velocidad")
     densidad  = datos.get("densidad")
 
-    # Solo evaluar si tenemos al menos una métrica
-    if cola is None and velocidad is None and densidad is None:
-        return datos["estado"]
+    violaciones = 0
+    detalle     = []
 
-    congestion = False
-    if cola      is not None and cola      >= REGLAS["max_cola_normal"]:
-        congestion = True
+    if cola is not None and cola >= REGLAS["max_cola_normal"]:
+        violaciones += 1
+        detalle.append(f"Q={cola}≥{REGLAS['max_cola_normal']}")
+
     if velocidad is not None and velocidad <= REGLAS["max_velocidad_congestion"]:
-        congestion = True
-    if densidad  is not None and densidad  >= REGLAS["max_densidad_normal"]:
-        congestion = True
+        violaciones += 1
+        detalle.append(f"Vp={velocidad}≤{REGLAS['max_velocidad_congestion']}")
 
-    if datos["estado"] == "PRIORIDAD":
-        return "PRIORIDAD"
+    if densidad is not None and densidad >= REGLAS["max_densidad_normal"]:
+        violaciones += 1
+        detalle.append(f"D={densidad}≥{REGLAS['max_densidad_normal']}")
 
-    return "CONGESTION" if congestion else "NORMAL"
+    # Correlación: se necesitan al menos 2 condiciones para declarar CONGESTION
+    return ("CONGESTION", detalle) if violaciones >= 2 else ("NORMAL", detalle)
+
+def imprimir_cambio_estado(interseccion, estado_anterior, nuevo_estado, datos, detalle):
+    print(f"\n[ANALITICA {ts()}] {'='*52}")
+    print(f"[ANALITICA] CAMBIO DE ESTADO: {interseccion}")
+    print(f"[ANALITICA] {estado_anterior} → {nuevo_estado}")
+    print(f"[ANALITICA] Métricas actuales:")
+    print(f"[ANALITICA]   Cola (Q):       {datos.get('cola','N/A')} veh    | umbral ≥ {REGLAS['max_cola_normal']}")
+    print(f"[ANALITICA]   Velocidad (Vp): {datos.get('velocidad','N/A')} km/h  | umbral ≤ {REGLAS['max_velocidad_congestion']}")
+    print(f"[ANALITICA]   Densidad (D):   {datos.get('densidad','N/A')} v/min | umbral ≥ {REGLAS['max_densidad_normal']}")
+    if detalle:
+        print(f"[ANALITICA] Condiciones de congestión detectadas ({len(detalle)}/3):")
+        for d in detalle:
+            print(f"[ANALITICA]   ⚠  {d}")
+    if nuevo_estado == "CONGESTION":
+        t = config['semaforos']['tiempo_verde_congestion']
+        print(f"[ANALITICA] Acción: Extender verde a {t}s por fase")
+    elif nuevo_estado == "NORMAL":
+        t = config['semaforos']['tiempo_verde_normal']
+        print(f"[ANALITICA] Acción: Verde normal {t}s por fase")
+    print(f"[ANALITICA] {'='*52}\n")
 
 # ── Procesamiento de eventos ──────────────────────────────────────────────────
-def procesar_evento(topic, evento, socket_db_principal, socket_db_replica,
-                    socket_semaforos):
+def procesar_evento(topic, evento, socket_db_principal, socket_db_replica, socket_semaforos):
     interseccion = evento.get("interseccion")
-    if interseccion not in estado_intersecciones:
+    if not interseccion or interseccion not in estado_intersecciones:
         return
 
     with lock_estado:
-        datos = estado_intersecciones[interseccion]
+        datos          = estado_intersecciones[interseccion]
         estado_anterior = datos["estado"]
 
         if topic == "camara":
             datos["cola"]      = evento.get("volumen")
             datos["velocidad"] = evento.get("velocidad_promedio")
 
-        elif topic == "espira":
-            vehiculos  = evento.get("vehiculos_contados", 0)
-            intervalo  = evento.get("intervalo_segundos", 30)
+        elif topic in ("espira", "espira_inductiva"):
+            vehiculos = evento.get("vehiculos_contados", 0)
+            intervalo = evento.get("intervalo_segundos", 30)
             datos["densidad"] = round(vehiculos / intervalo * 60, 2)
 
         elif topic == "gps":
-            datos["velocidad"]     = evento.get("velocidad_promedio")
+            datos["velocidad"]      = evento.get("velocidad_promedio")
             datos["congestion_gps"] = evento.get("nivel_congestion")
 
-        nuevo_estado = evaluar_estado(datos)
+        resultado, detalle = evaluar_estado(datos)
+        nuevo_estado = resultado
         datos["estado"] = nuevo_estado
 
         if nuevo_estado == "CONGESTION":
@@ -94,19 +155,33 @@ def procesar_evento(topic, evento, socket_db_principal, socket_db_replica,
 
         estado_detectado = nuevo_estado
 
-    # Anotar evento y enviar a ambas BDs
+    # Imprimir siempre el estado actual (breve)
+    with lock_pc3:
+        estado_pc3 = "OK" if pc3_disponible else "CAIDO"
+    print(f"[ANALITICA {ts()}] {interseccion}: {estado_detectado} | "
+          f"Q={datos['cola']} Vp={datos['velocidad']} D={datos['densidad']} | "
+          f"FILA={datos['sem_fila']} CAR={datos['sem_carrera']} | PC3:{estado_pc3}")
+
+    # Imprimir detalle solo cuando hay cambio de estado
+    if nuevo_estado != estado_anterior:
+        imprimir_cambio_estado(interseccion, estado_anterior, nuevo_estado, datos, detalle)
+
+    # Anotar evento con estado y enviar a BDs
     evento_db = dict(evento)
     evento_db["estado_detectado"] = estado_detectado
     evento_db["topic"]            = topic
 
-    socket_db_principal.send_json(evento_db)
+    with lock_pc3:
+        pc3_up = pc3_disponible
+
+    if pc3_up:
+        socket_db_principal.send_json(evento_db)
+    else:
+        buffer_sync.append(dict(evento_db))  # Guardar para sincronizar después
+
     socket_db_replica.send_json(evento_db)
 
-    print(f"[ANALITICA] {interseccion}: estado={estado_detectado} | "
-          f"cola={datos['cola']}, vel={datos['velocidad']}, dens={datos['densidad']} | "
-          f"FILA={datos['sem_fila']} CARRERA={datos['sem_carrera']}")
-
-    # Si cambió el estado, enviar comando al servicio de semáforos
+    # Enviar comando a semáforos solo cuando cambia el estado
     if nuevo_estado != estado_anterior:
         tiempo_verde = (
             config['semaforos']['tiempo_verde_congestion']
@@ -117,20 +192,74 @@ def procesar_evento(topic, evento, socket_db_principal, socket_db_replica,
             "tipo":         "cambio_estado",
             "interseccion": interseccion,
             "estado":       nuevo_estado,
-            "semaforo":     datos["semaforo"],
             "tiempo_verde": tiempo_verde,
             "motivo":       nuevo_estado,
             "timestamp":    datetime.now(timezone.utc).isoformat()
         }
         socket_semaforos.send_json(comando)
-        print(f"[ANALITICA] >> Semáforo {interseccion}: "
-              f"{estado_anterior} → {nuevo_estado} (verde={tiempo_verde}s)")
 
-# ── Hilo para atender comandos del monitoreo (REP) ───────────────────────────
+# ── Sincronización con PC3 después de recuperación ───────────────────────────
+def sincronizar_con_principal(socket_db_principal):
+    global buffer_sync
+    pendientes = len(buffer_sync)
+    if pendientes == 0:
+        print("[SYNC] No hay eventos pendientes")
+        return
+
+    print(f"[SYNC] Sincronizando {pendientes} eventos a PC3...")
+    count = 0
+    while buffer_sync:
+        try:
+            evento = buffer_sync.popleft()
+            evento["sync_recovery"] = True
+            socket_db_principal.send_json(evento)
+            count += 1
+        except Exception as e:
+            print(f"[SYNC] Error en evento {count}: {e}")
+            break
+    print(f"[SYNC] ✓ {count} eventos sincronizados a BD Principal (PC3)")
+
+# ── Health check de PC3 ───────────────────────────────────────────────────────
+def hilo_healthcheck(context, socket_db_principal):
+    global pc3_disponible, pc3_estaba_caido
+
+    while True:
+        try:
+            s = context.socket(zmq.REQ)
+            s.setsockopt(zmq.RCVTIMEO, 2000)
+            s.setsockopt(zmq.LINGER, 0)
+            s.connect(f"tcp://{IP_PC3}:{P['db_principal_query']}")
+            s.send_json({"tipo": "ping"})
+            s.recv_json()
+            s.close()
+
+            with lock_pc3:
+                recuperado       = not pc3_disponible
+                pc3_disponible   = True
+
+            if recuperado:
+                print(f"\n[HEALTHCHECK {ts()}] ✓ PC3 recuperado — sincronizando...")
+                pc3_estaba_caido = False
+                sincronizar_con_principal(socket_db_principal)
+
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+            with lock_pc3:
+                if pc3_disponible:
+                    print(f"\n[HEALTHCHECK {ts()}] ⚠  PC3 caído — redirigiendo a BD Réplica")
+                    pc3_estaba_caido = True
+                pc3_disponible = False
+
+        time.sleep(5)
+
+# ── Hilo monitoreo REP ────────────────────────────────────────────────────────
 def hilo_monitoreo(context, socket_semaforos, socket_db_principal, socket_db_replica):
     socket_rep = context.socket(zmq.REP)
     socket_rep.bind(f"tcp://*:{P['analitica_monitoreo']}")
-    print(f"[ANALITICA] Escuchando comandos de monitoreo en puerto {P['analitica_monitoreo']}")
+    print(f"[ANALITICA] Esperando comandos de monitoreo en puerto {P['analitica_monitoreo']}")
 
     while True:
         try:
@@ -143,8 +272,7 @@ def hilo_monitoreo(context, socket_semaforos, socket_db_principal, socket_db_rep
                     if interseccion and interseccion in estado_intersecciones:
                         resp = {"exito": True, "datos": estado_intersecciones[interseccion]}
                     else:
-                        # Devolver todos los estados
-                        resp = {"exito": True, "datos": estado_intersecciones}
+                        resp = {"exito": True, "datos": dict(estado_intersecciones)}
 
             elif tipo == "priorizar":
                 via    = comando.get("via", [])
@@ -164,26 +292,31 @@ def hilo_monitoreo(context, socket_semaforos, socket_db_principal, socket_db_rep
                 }
                 socket_semaforos.send_json(cmd_ola)
 
-                # Guardar en BD
-                evento_prioridad = {
+                ev_prioridad = {
                     "topic":            "prioridad",
                     "tipo_sensor":      "manual",
+                    "interseccion":     via[0] if via else "",
                     "via":              via,
                     "motivo":           motivo,
                     "estado_detectado": "PRIORIDAD",
                     "timestamp":        datetime.now(timezone.utc).isoformat()
                 }
-                socket_db_principal.send_json(evento_prioridad)
-                socket_db_replica.send_json(evento_prioridad)
+                with lock_pc3:
+                    pc3_up = pc3_disponible
+                if pc3_up:
+                    socket_db_principal.send_json(ev_prioridad)
+                else:
+                    buffer_sync.append(dict(ev_prioridad))
+                socket_db_replica.send_json(ev_prioridad)
 
-                print(f"[ANALITICA] OLA VERDE activada en: {via} — motivo: {motivo}")
+                print(f"[ANALITICA {ts()}] OLA VERDE activada en {via} — motivo: {motivo}")
                 resp = {"exito": True, "mensaje": f"Ola verde activada en {via}"}
 
             elif tipo == "ping":
                 resp = {"exito": True, "mensaje": "pong"}
 
             else:
-                resp = {"exito": False, "error": f"Tipo de comando desconocido: {tipo}"}
+                resp = {"exito": False, "error": f"Tipo desconocido: {tipo}"}
 
             socket_rep.send_json(resp)
 
@@ -195,6 +328,8 @@ def hilo_monitoreo(context, socket_semaforos, socket_db_principal, socket_db_rep
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    print(REGLAS_DESCRIPCION)
+
     context = zmq.Context()
 
     socket_sub = context.socket(zmq.SUB)
@@ -210,24 +345,32 @@ def main():
     socket_semaforos = context.socket(zmq.PUSH)
     socket_semaforos.connect(f"tcp://{IP_PC2}:{P['analitica_semaforos']}")
 
-    print("=" * 55)
+    print("=" * 60)
     print("  SERVICIO DE ANALÍTICA - PC2")
-    print("=" * 55)
-    print(f"  Broker (PC1):        {IP_PC1}:{P['broker_analitica']}")
-    print(f"  BD Principal (PC3):  {IP_PC3}:{P['analitica_db_principal']}")
-    print(f"  BD Réplica (PC2):    {IP_PC2}:{P['analitica_db_replica']}")
-    print(f"  Semáforos (PC2):     {IP_PC2}:{P['analitica_semaforos']}")
-    print("=" * 55)
+    print("=" * 60)
+    print(f"  Broker (PC1):       {IP_PC1}:{P['broker_analitica']}")
+    print(f"  BD Principal (PC3): {IP_PC3}:{P['analitica_db_principal']}")
+    print(f"  BD Réplica (PC2):   {IP_PC2}:{P['analitica_db_replica']}")
+    print(f"  Semáforos (PC2):    {IP_PC2}:{P['analitica_semaforos']}")
+    print(f"  Health check PC3:   cada 5s")
+    print("=" * 60)
 
-    # Hilo para atender comandos del monitoreo
-    t = threading.Thread(
+    # Hilo monitoreo REP
+    threading.Thread(
         target=hilo_monitoreo,
         args=(context, socket_semaforos, socket_db_principal, socket_db_replica),
         daemon=True
-    )
-    t.start()
+    ).start()
+
+    # Hilo health check
+    threading.Thread(
+        target=hilo_healthcheck,
+        args=(context, socket_db_principal),
+        daemon=True
+    ).start()
 
     # Bucle principal: procesar eventos de sensores
+    print("[ANALITICA] Esperando eventos de sensores...\n")
     while True:
         try:
             partes = socket_sub.recv_multipart()
@@ -238,9 +381,9 @@ def main():
             procesar_evento(topic, evento, socket_db_principal,
                             socket_db_replica, socket_semaforos)
         except json.JSONDecodeError as e:
-            print(f"[ANALITICA] Error decodificando evento: {e}")
+            print(f"[ANALITICA] Error JSON: {e}")
         except Exception as e:
-            print(f"[ANALITICA] Error inesperado: {e}")
+            print(f"[ANALITICA] Error: {e}")
 
 if __name__ == "__main__":
     main()

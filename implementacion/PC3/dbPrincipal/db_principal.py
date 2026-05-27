@@ -195,6 +195,9 @@ def manejar_query(cursor, peticion):
         rows = [dict(zip(cols, [str(v) for v in r])) for r in cursor.fetchall()]
         return {"exito": True, "datos": rows, "fuente": "principal"}
 
+    elif tipo == "ping":
+        return {"exito": True, "mensaje": "pong", "fuente": "principal"}
+
     else:
         return {"exito": False, "error": f"Tipo de consulta desconocido: {tipo}"}
 

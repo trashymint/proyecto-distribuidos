@@ -150,13 +150,34 @@ def parsear_via(inter_inicio, inter_fin, config):
 
     return via
 
+REGLAS_INFO = f"""
+╔══════════════════════════════════════════════════════════╗
+║           SISTEMA DE GESTIÓN DE TRÁFICO                  ║
+╠══════════════════════════════════════════════════════════╣
+║  REGLAS DE TRÁFICO (correlación ≥2 condiciones):         ║
+║                                                          ║
+║  NORMAL:     Q<{config['reglas']['max_cola_normal']}  AND  Vp>{config['reglas']['min_velocidad_normal']}km/h  AND  D<{config['reglas']['max_densidad_normal']}veh/min        ║
+║  CONGESTION: Q≥{config['reglas']['max_cola_normal']}  OR   Vp≤{config['reglas']['max_velocidad_congestion']}km/h  OR   D≥{config['reglas']['max_densidad_normal']}veh/min        ║
+║             (mínimo 2 de 3 condiciones)                  ║
+║  PRIORIDAD:  Comando manual (ambulancia/emergencia)       ║
+║                                                          ║
+║  Semáforos por intersección: FILA (calle) + CARRERA      ║
+║  Tiempo verde normal:     {config['semaforos']['tiempo_verde_normal']}s                           ║
+║  Tiempo verde congestión: {config['semaforos']['tiempo_verde_congestion']}s                           ║
+║                                                          ║
+║  FALLO PC3: Failover automático a BD Réplica (PC2)       ║
+║  RECUPERACIÓN: Sincronización automática al reconectar   ║
+╚══════════════════════════════════════════════════════════╝
+"""
+
 def main():
     context = zmq.Context()
 
+    print(REGLAS_INFO)
     print(AYUDA)
-    print(f"  Conectado a BD Principal: {IP_PC3}:{P['db_principal_query']}")
-    print(f"  Fallback BD Réplica:     {IP_PC2}:{P['db_replica_query']}")
-    print(f"  Analítica (comandos):    {IP_PC2}:{P['analitica_monitoreo']}\n")
+    print(f"  BD Principal (PC3): {IP_PC3}:{P['db_principal_query']}")
+    print(f"  BD Réplica   (PC2): {IP_PC2}:{P['db_replica_query']}")
+    print(f"  Analítica    (PC2): {IP_PC2}:{P['analitica_monitoreo']}\n")
 
     while True:
         try:

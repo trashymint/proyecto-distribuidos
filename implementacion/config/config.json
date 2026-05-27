@@ -4,9 +4,9 @@
     "columnas": [1, 2, 3, 4]
   },
   "ips": {
-    "PC1": "127.0.0.1",
-    "PC2": "127.0.0.1",
-    "PC3": "127.0.0.1"
+    "PC1": "10.0.2.15",
+    "PC2": "10.101.138.221",
+    "PC3": "10.43.99.138"
   },
   "puertos": {
     "sensores_broker":        5555,
@@ -22,15 +22,15 @@
     "host":     "127.0.0.1",
     "port":     3306,
     "user":     "root",
-    "password": "password",
-    "database": "trafico_db_replica"
+    "password": "root",
+    "database": "db_replica"
   },
   "mysql_pc3": {
     "host":     "127.0.0.1",
     "port":     3306,
     "user":     "root",
-    "password": "password",
-    "database": "trafico_db"
+    "password": "root",
+    "database": "db_principal"
   },
   "sensores": {
     "intervalo_camara":  10,
